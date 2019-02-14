@@ -14,6 +14,7 @@
     using System.Security.Cryptography;
     using ICSharpCode.SharpZipLib.Tar;
     using ICSharpCode.SharpZipLib.GZip;
+    using NuGet.Unity;
 
     /// <summary>
     /// A set of helper methods that act as a wrapper around nuget.exe
@@ -30,10 +31,12 @@
         /// </summary>
         public static readonly string NugetConfigFilePath = Path.Combine(Application.dataPath, "./NuGet.config");
 
+        public static readonly string PackagesFileName = "packages.config";
+
         /// <summary>
         /// The path to the packages.config file.
         /// </summary>
-        private static readonly string PackagesConfigFilePath = Path.Combine(Application.dataPath, "./packages.config");
+        public static readonly string PackagesConfigFilePath = Path.Combine(Application.dataPath, PackagesFileName);
 
         /// <summary>
         /// The path where to put created (packed) and downloaded (not installed yet) .nupkg files.
@@ -64,10 +67,14 @@
             {
                 if (packagesConfigFile == null)
                 {
-                    packagesConfigFile = PackagesConfigFile.Load(PackagesConfigFilePath);
+                    LoadPackagesConfigFile();
                 }
 
                 return packagesConfigFile;
+            }
+            set
+            {
+                packagesConfigFile = value;
             }
         }
 
@@ -80,6 +87,9 @@
         /// The dictionary of currently installed <see cref="NugetPackage"/>s keyed off of their ID string.
         /// </summary>
         private static Dictionary<string, NugetPackage> installedPackages = new Dictionary<string, NugetPackage>();
+
+
+        private static string packageSourceCodeFormat = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), $"Packages{Path.DirectorySeparatorChar}{{0}}.{{1}}{Path.DirectorySeparatorChar}source");
 
         /// <summary>
         /// The current .NET version being used (2.0 [actually 3.5], 4.6, etc).
@@ -115,7 +125,15 @@
             // restore packages - this will be called EVERY time the project is loaded or a code-file changes
             Restore();
         }
+            
+        public static PackagesConfigFile LoadPackagesConfigFile()
+        {
+            packagesConfigFile = PackagesConfigFile.Load(PackagesConfigFilePath);
 
+            return packagesConfigFile;
+        }
+
+    
         /// <summary>
         /// Loads the NuGet.config file.
         /// </summary>
@@ -455,6 +473,27 @@
                 }
             }
 
+            // Source allows us to remap the MDB for source code debugging of dlls...
+            if(Directory.Exists(packageInstallDirectory + "/source"))
+            {
+                // Move the source folder to AppData...
+                string sourceInstallDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), $"Packages{Path.DirectorySeparatorChar}{package.Id}.{package.Version}{Path.DirectorySeparatorChar}source");
+
+                LogVerbose("Moving {0} to {1}", packageInstallDirectory + "/source", sourceInstallDirectory);
+
+                // create the directory to create any of the missing folders in the path
+                Directory.CreateDirectory(sourceInstallDirectory);
+
+                // delete the final directory to prevent the Move operation from throwing exceptions.
+                DeleteDirectory(sourceInstallDirectory);
+
+                Directory.Move(packageInstallDirectory + "/source", sourceInstallDirectory);
+
+                // Generate mdb and rebase...
+                GenerateMdbForPackage(package);
+                MdbRebaseForPackage(package);
+            }
+
             if (Directory.Exists(packageInstallDirectory + "/tools"))
             {
                 // Move the tools folder outside of the Unity Assets folder
@@ -472,7 +511,7 @@
             }
 
             // delete all PDB files since Unity uses Mono and requires MDB files, which causes it to output "missing MDB" errors
-            DeleteAllFiles(packageInstallDirectory, "*.pdb");
+            //DeleteAllFiles(packageInstallDirectory, "*.pdb");
 
             // if there are native DLLs, copy them to the Unity project root (1 up from Assets)
             if (Directory.Exists(packageInstallDirectory + "/output"))
@@ -577,6 +616,160 @@
                 DeleteDirectory(packageInstallDirectory + "/StreamingAssets");
                 DeleteFile(packageInstallDirectory + "/StreamingAssets.meta");
             }
+        }
+
+        public static void GenerateMdbsForInstalledPackages()
+        {
+            var index = 0;
+            var total = InstalledPackages.Count();
+
+            foreach(var package in InstalledPackages)
+            {
+                EditorUtility.DisplayProgressBar("Mdb Generation", $"Processing package: {package.Id}.{package.Version}", (float)index / total);
+
+                if(HasSourceCodeForPackage(package))
+                {
+                    GenerateMdbForPackage(package);
+                }
+
+                index++;
+            }
+
+            EditorUtility.ClearProgressBar();
+        }
+
+        public static void RebaseForInstalledPackages()
+        {
+            var index = 0;
+            var total = InstalledPackages.Count();
+
+            foreach (var package in InstalledPackages)
+            {
+                EditorUtility.DisplayProgressBar("Mdb Rebase", $"Processing package: {package.Id}.{package.Version}", (float)index / total);
+
+                if (HasSourceCodeForPackage(package))
+                {
+                    MdbRebaseForPackage(package);
+                }
+
+                index++;
+            }
+
+            EditorUtility.ClearProgressBar();
+        }
+
+        public static bool HasSourceCodeForPackage(NugetPackageIdentifier nugetPackage)
+        {
+            if(Directory.Exists(string.Format(packageSourceCodeFormat, nugetPackage.Id, nugetPackage.Version)))
+            {
+                return true;
+            }
+
+            return false;
+        }
+
+        public static void GenerateMdbForPackage(NugetPackageIdentifier nugetPackage)
+        {
+            var packageInstallDirectory = GetPackageInstallDirectory(nugetPackage);
+            var dlls = GetFilesWithinFolder(packageInstallDirectory, ".dll");
+
+            foreach(var dllPath in dlls)
+            {
+                DebugSymbolUtility.GenerateMdbFromAssembly(dllPath);
+            }
+        }
+
+        private static void MdbRebaseForPackage(NugetPackageIdentifier nugetPackage)
+        {
+            var packageInstallDirectory = GetPackageInstallDirectory(nugetPackage);
+            var sourceCodeDirectory = GetPackageSourceCodeDirectory(nugetPackage);
+
+            var mdbs = GetFilesWithinFolder(packageInstallDirectory, ".mdb");
+            var sourceFiles = FetchSourceFileNamesAndRelativePaths(sourceCodeDirectory, sourceCodeDirectory);
+
+            foreach(var mdbPath in mdbs)
+            {
+                Debug.Log(mdbPath);
+                DebugSymbolUtility.MdbRebase(mdbPath, sourceCodeDirectory, sourceFiles.ToArray());
+            }
+        }
+
+        private static string GetPackageSourceCodeDirectory(NugetPackageIdentifier nugetPackage)
+        {
+            return string.Format(packageSourceCodeFormat, nugetPackage.Id, nugetPackage.Version);
+        }
+
+        private static string GetPackageInstallDirectory(NugetPackageIdentifier nugetPackage)
+        {
+            return Path.Combine(NugetConfigFile.RepositoryPath, string.Format("{0}.{1}", nugetPackage.Id, nugetPackage.Version));
+        }
+
+        private static List<string> GetFilesWithinFolder(string folder, string extension)
+        {
+            var filePaths = new List<string>();
+
+            foreach(var file in Directory.GetFiles(folder))
+            {
+                if(file.EndsWith(extension))
+                {
+                    filePaths.Add(file);
+                }
+            }
+
+            foreach(var directory in Directory.GetDirectories(folder))
+            {
+                var childPaths = GetFilesWithinFolder(directory, extension);
+                filePaths.AddRange(childPaths);
+            }
+
+            return filePaths;
+        }
+       
+        public static string FetchFirstFileWithExtension(string packageInstallDirectory, string extension)
+        {
+            foreach(var file in Directory.GetFiles(packageInstallDirectory))
+            {
+                if(file.EndsWith(extension))
+                {
+                    return file;
+                }
+            }
+
+            foreach(var subdirectory in Directory.GetDirectories(packageInstallDirectory))
+            {
+                var mdbPath = FetchFirstFileWithExtension(subdirectory, extension);
+
+                if(mdbPath != null)
+                {
+                    return mdbPath;
+                }
+            }
+
+            return null;
+        }
+
+        public static List<string> FetchSourceFileNamesAndRelativePaths(string rootDirectory, string directory)
+        {
+            var data = new List<string>();
+
+            foreach(var file in Directory.GetFiles(directory))
+            {
+                var fileInfo = new FileInfo(file);
+
+                if(file.EndsWith(".cs"))
+                {
+                    data.Add(file.Replace(rootDirectory, string.Empty));
+                }
+            }
+            
+            foreach(var subdirectory in Directory.GetDirectories(directory))
+            {
+                var subdata = FetchSourceFileNamesAndRelativePaths(rootDirectory, subdirectory);
+
+                data.AddRange(subdata);
+            }
+
+            return data;
         }
 
         /// <summary>
@@ -1293,7 +1486,7 @@
                         foreach (ZipEntry entry in zip)
                         {
                             entry.Extract(baseDirectory, ExtractExistingFileAction.OverwriteSilently);
-                            if (NugetConfigFile.ReadOnlyPackageFiles)
+                            if (NugetConfigFile.ReadOnlyPackageFiles && !entry.FileName.EndsWith(".mdb"))
                             {
                                 FileInfo extractedFile = new FileInfo(Path.Combine(baseDirectory, entry.FileName));
                                 extractedFile.Attributes |= FileAttributes.ReadOnly;
